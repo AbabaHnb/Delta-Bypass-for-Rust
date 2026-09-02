@@ -52,8 +52,19 @@ env:
     api -X GET "$BASE/api/v1/im/bots" -H "$AUTH"
     [ "$CODE" = 200 ] && BOTS=$(printf %s "$BODY" | jq -r '(.data.bot_ids//[])[]' 2>/dev/null)
     [ -n "$BOTS" ] || echo "::warning::读取 /api/v1/im/bots 失败（HTTP $CODE）"
-    [ -n "$PLAT" ] || [ "$(printf '%s\n' "$BOTS" | grep -c .)" != 1 ] || PLAT="$BOTS"
-    PLAT="${PLAT:-aiocqhttp}"
+    if [ -z "$PLAT" ]; then
+      N=$(printf '%s\n' "$BOTS" | grep -c . || true)
+      if [ "${N:-0}" = 1 ]; then
+        PLAT="$BOTS"
+        echo "只有一个平台实例，自动使用 $PLAT"
+      elif [ "${N:-0}" -gt 1 ]; then
+        echo "::error::AstrBot 有 $N 个平台实例，必须用仓库变量 ASTRBOT_PLATFORM_ID 指定一个：$(printf '%s' "$BOTS" | tr '\n' ' ')"
+        exit 1
+      else
+        PLAT=aiocqhttp
+        echo "::warning::拿不到平台实例列表，暂用 $PLAT"
+      fi
+    fi
     DTYPE=$(ctype "${AB_MSG_TYPE:-GroupMessage}" || printf GroupMessage)
 
     PARTS='[]'
