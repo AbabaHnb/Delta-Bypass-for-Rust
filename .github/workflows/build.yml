@@ -7,13 +7,217 @@ on:
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      release:
+        description: '发布 GitHub Release'
+        type: boolean
+        default: true
+      tag:
+        description: 'Release tag（留空则用 Cargo.toml 版本）'
+        type: string
+        default: ''
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PROJECT_NAME: Delta Bypass for Rust
+  NOTIFY_SCRIPT: |
+    set -uo pipefail
+    [ -n "${AB_URL:-}" ] && [ -n "${AB_TOKEN:-}" ] && [ -n "${AB_TARGETS:-}" ] || {
+      echo "::notice::AstrBot 推送未配置，跳过"; exit 0; }
+
+    BASE="${AB_URL%%/api/v1*}"; BASE="${BASE%/}"
+    AUTH="Authorization: Bearer $AB_TOKEN"
+    CODE=""; BODY=""
+    api() {
+      local r
+      r=$(curl -sS --max-time 180 -w $'\n%{http_code}' "$@" 2>&1) || true
+      CODE="${r##*$'\n'}"; BODY="${r%$'\n'*}"
+    }
+    ctype() {
+      case "$(printf %s "$1" | tr 'A-Z' 'a-z')" in
+        group|groupmessage|g) printf GroupMessage ;;
+        private|friend|friendmessage|user|p|f) printf FriendMessage ;;
+        other|othermessage|o) printf OtherMessage ;;
+        *) return 1 ;;
+      esac
+    }
+
+    PLAT="${AB_PLATFORM:-}"; BOTS=""
+    api -X GET "$BASE/api/v1/im/bots" -H "$AUTH"
+    [ "$CODE" = 200 ] && BOTS=$(printf %s "$BODY" | jq -r '(.data.bot_ids//[])[]' 2>/dev/null)
+    [ -n "$BOTS" ] || echo "::warning::读取 /api/v1/im/bots 失败（HTTP $CODE）"
+    [ -n "$PLAT" ] || [ "$(printf '%s\n' "$BOTS" | grep -c .)" != 1 ] || PLAT="$BOTS"
+    PLAT="${PLAT:-aiocqhttp}"
+    DTYPE=$(ctype "${AB_MSG_TYPE:-GroupMessage}" || printf GroupMessage)
+
+    PARTS='[]'
+    [ -z "${AB_TEXT:-}" ] || PARTS=$(jq -n --arg t "$AB_TEXT" '[{type:"plain",text:$t}]')
+
+    if [ -n "${AB_FILES:-}" ]; then
+      LIST=$(mktemp); printf '%s\n' "$AB_FILES" > "$LIST"
+      while IFS= read -r f; do
+        f=$(printf %s "$f" | sed 's/[[:space:]]*$//')
+        [ -n "$f" ] || continue
+        [ -f "$f" ] || { echo "::warning::文件不存在：$f"; continue; }
+        n=$(basename "$f")
+        api -X POST "$BASE/api/v1/file" -H "$AUTH" -F "file=@$f"
+        FID=$(printf %s "$BODY" | jq -r '.data.attachment_id//.attachment_id//empty' 2>/dev/null)
+        [ "$CODE" = 200 ] && [ -n "$FID" ] || {
+          echo "::warning::上传 $n 失败（HTTP $CODE）：$BODY"; continue; }
+        echo "已上传 $n"
+        PARTS=$(printf %s "$PARTS" | jq --arg i "$FID" --arg n "$n" \
+          '.+[{type:"file",attachment_id:$i,filename:$n}]')
+      done < "$LIST"
+      rm -f "$LIST"
+    fi
+
+    [ "$(printf %s "$PARTS" | jq length)" != 0 ] || {
+      echo "::warning::没有可发送的内容"; exit 0; }
+
+    FAIL=0; SENT=0; IDX=0; OIFS="$IFS"; IFS=','
+    for item in $AB_TARGETS; do
+      IFS="$OIFS"; IDX=$((IDX+1))
+      item=$(printf %s "$item" | tr -d '[:space:]')
+      [ -n "$item" ] || { IFS=','; continue; }
+      case "$item" in
+        *:*:*) p="${item%%:*}"; rest="${item#*:}"; ty="${rest%%:*}"; sess="${rest#*:}" ;;
+        *:*)   p="$PLAT"; ty="${item%%:*}"; sess="${item#*:}" ;;
+        *)     p="$PLAT"; ty="$DTYPE"; sess="$item" ;;
+      esac
+      if ! ty=$(ctype "$ty"); then
+        echo "::error::目标 #$IDX 消息类型无效，只能是 GroupMessage / FriendMessage / OtherMessage"
+        FAIL=1; IFS=','; continue
+      fi
+      if [ -z "$sess" ] || [ -z "$p" ]; then
+        echo "::error::目标 #$IDX 缺少会话号"; FAIL=1; IFS=','; continue
+      fi
+      [ -z "$BOTS" ] || printf '%s\n' "$BOTS" | grep -qx "$p" \
+        || echo "::warning::目标 #$IDX 的平台实例 $p 未在运行"
+      api -X POST "$BASE/api/v1/im/messages" -H "$AUTH" \
+        -H 'Content-Type: application/json' \
+        -d "$(jq -n --arg u "$p:$ty:$sess" --argjson m "$PARTS" '{umo:$u,message:$m}')"
+      if [ "$CODE" = 200 ] && [ "$(printf %s "$BODY" | jq -r '.status//empty')" = ok ]; then
+        echo "目标 #$IDX（$ty）发送成功"; SENT=$((SENT+1))
+      else
+        MSG=$(printf %s "$BODY" | jq -r '.message//empty' 2>/dev/null)
+        echo "::error::目标 #$IDX（$ty）发送失败：HTTP $CODE ${MSG:-$BODY}"
+        FAIL=1
+      fi
+      IFS=','
+    done
+    IFS="$OIFS"
+    echo "发送成功 $SENT / $IDX 个目标"
+    [ "$FAIL" = 0 ] || exit 1
 
 jobs:
+  notify-start:
+    name: 通知：检测到提交
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: 汇总提交信息
+        id: info
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VER="$GITHUB_REF_NAME"
+          elif [[ -n "${INPUT_TAG:-}" ]]; then
+            VER="$INPUT_TAG"
+          else
+            CARGO_VER=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+            VER="v${CARGO_VER:-0.0.0}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          COMMIT_MSG=$(git log -1 --pretty=format:%s)
+          COMMITTER=$(git log -1 --pretty=format:%an)
+          COMMIT_TIME=$(git log -1 --date=format:'%Y-%m-%d %H:%M:%S' --pretty=format:%ad)
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          COMMIT_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+
+          if git rev-parse --verify -q HEAD^2 >/dev/null 2>&1; then
+            git diff --name-status HEAD^1 HEAD > "$RUNNER_TEMP/raw.txt" || true
+          else
+            git diff-tree --no-commit-id --name-status -r --root HEAD > "$RUNNER_TEMP/raw.txt" || true
+          fi
+          TOTAL=$(grep -c . "$RUNNER_TEMP/raw.txt" || true)
+          TOTAL=${TOTAL:-0}
+          awk -F'\t' 'NF>=2 {
+            s=substr($1,1,1)
+            if (s=="A") n="新增"; else if (s=="M") n="修改";
+            else if (s=="D") n="删除"; else if (s=="R") n="重命名";
+            else if (s=="C") n="复制"; else if (s=="T") n="类型变更"; else n=$1
+            printf "%s  %s%s\n", n, $2, (NF>=3 ? " -> " $3 : "")
+          }' "$RUNNER_TEMP/raw.txt" | head -n 30 > "$RUNNER_TEMP/changed.txt"
+          if [ "$TOTAL" -gt 30 ]; then
+            echo "……以及其余 $((TOTAL-30)) 个文件" >> "$RUNNER_TEMP/changed.txt"
+          fi
+          [ -s "$RUNNER_TEMP/changed.txt" ] || echo "（本次提交没有文件变更）" > "$RUNNER_TEMP/changed.txt"
+
+          {
+            printf '[%s] 检测到新提交\n' "$PROJECT_NAME"
+            printf '[仓库] %s\n' "$GITHUB_REPOSITORY"
+            printf '[版本] %s\n' "$VER"
+            printf '[分支/Tag] %s\n' "$GITHUB_REF_NAME"
+            printf '[触发方式] %s\n' "$GITHUB_EVENT_NAME"
+            printf '[提交者] %s\n' "$COMMITTER"
+            printf '[提交时间] %s\n' "$COMMIT_TIME"
+            printf '[Commit] %s\n' "$SHORT_SHA"
+            printf '[提交说明] %s\n' "$COMMIT_MSG"
+            printf '[Commit详情] %s' "$COMMIT_URL"
+          } > "$RUNNER_TEMP/msg1.txt"
+
+          {
+            printf '[%s] 本次提交的文件变更记录（共 %s 个）\n' "$PROJECT_NAME" "$TOTAL"
+            cat "$RUNNER_TEMP/changed.txt"
+          } > "$RUNNER_TEMP/msg2.txt"
+
+          {
+            printf '[%s] 开始构建 %s\n' "$PROJECT_NAME" "$VER"
+            printf '[构建目标]\n'
+            printf '%s\n' '- Windows x64 (msvc)'
+            printf '%s\n' '- Linux x64 (gnu)'
+            printf '%s\n' '- Linux x64 (musl)'
+            printf '[进度查看] %s' "$RUN_URL"
+          } > "$RUNNER_TEMP/msg3.txt"
+
+      - name: 推送消息①②③
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        shell: bash
+        env:
+          AB_URL: ${{ secrets.ASTRBOT_URL }}
+          AB_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
+          AB_TARGETS: ${{ secrets.QQ_TARGET_ID }}
+          AB_PLATFORM: ${{ vars.ASTRBOT_PLATFORM_ID }}
+          AB_MSG_TYPE: ${{ vars.ASTRBOT_MSG_TYPE }}
+        run: |
+          printf '%s\n' "$NOTIFY_SCRIPT" > "$RUNNER_TEMP/send.sh"
+          for i in 1 2 3; do
+            AB_TEXT="$(cat "$RUNNER_TEMP/msg$i.txt")" bash "$RUNNER_TEMP/send.sh" \
+              || echo "::warning::消息 $i 推送失败"
+          done
+
   build:
     name: Build ${{ matrix.target }}
+    needs: notify-start
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,21 +236,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Extract Version
-        id: get_version
-        shell: bash
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VER="${{ github.ref_name }}"
-          else
-            CARGO_VER=$(grep '^version =' Cargo.toml | head -n1 | cut -d '"' -f2 || echo "1.0.0")
-            VER="v${CARGO_VER}"
-          fi
-          echo "VERSION=${VER}" >> $GITHUB_OUTPUT
-
-      - name: Install musl tools (Linux Musl)
+      - name: Install musl tools
         if: matrix.use_musl
         run: |
           sudo apt-get update
@@ -67,139 +259,146 @@ jobs:
 
       - name: Prepare Artifact with Version
         shell: bash
+        env:
+          VER: ${{ needs.notify-start.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          OS_NAME: ${{ matrix.os_name }}
         run: |
-          VER="${{ steps.get_version.outputs.VERSION }}"
-          if [ "${{ runner.os }}" = "Windows" ]; then
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
             OUT_NAME="delta-bypass-${VER}-windows-amd64.exe"
-            cp "target/${{ matrix.target }}/release/delta-bypass.exe" "${OUT_NAME}"
+            cp "target/${TARGET}/release/delta-bypass.exe" "$OUT_NAME"
           else
-            OUT_NAME="delta-bypass-${VER}-${{ matrix.os_name }}-amd64"
-            cp "target/${{ matrix.target }}/release/delta-bypass" "${OUT_NAME}"
-            chmod +x "${OUT_NAME}"
+            OUT_NAME="delta-bypass-${VER}-${OS_NAME}-amd64"
+            cp "target/${TARGET}/release/delta-bypass" "$OUT_NAME"
+            chmod +x "$OUT_NAME"
           fi
-          echo "OUT_NAME=${OUT_NAME}" >> $GITHUB_ENV
+          echo "OUT_NAME=${OUT_NAME}" >> "$GITHUB_ENV"
 
       - name: Upload Build Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.OUT_NAME }}
           path: ${{ env.OUT_NAME }}
+          if-no-files-found: error
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [ notify-start, build ]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.release)
+    permissions:
+      contents: write
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Release Binary on Tag Push
-        uses: softprops/action-gh-release@v2
+      - name: List artifacts
+        run: ls -lh artifacts
+
+      - name: Release Binary
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.notify-start.outputs.version }}
+          name: ${{ needs.notify-start.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: artifacts/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  notify:
-    name: Send AstrBot QQ Notification
-    needs: build
+  notify-result:
+    name: 通知：构建结果与产物
+    needs: [ notify-start, build, release ]
+    if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    if: always()
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        continue-on-error: true
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Send Message & Upload Windows & Linux Artifacts to AstrBot
+      - name: 汇总构建结果
         shell: bash
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          VER: ${{ needs.notify-start.outputs.version }}
         run: |
-          BASE_URL="${{ secrets.ASTRBOT_URL }}"
-          if [ -z "$BASE_URL" ]; then
-            echo "secrets.ASTRBOT_URL 未配置，跳过消息推送。"
-            exit 0
+          set -euo pipefail
+
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+
+          : > "$RUNNER_TEMP/files.txt"
+          if [ -d artifacts ]; then
+            find "$PWD/artifacts" -type f | sort > "$RUNNER_TEMP/files.txt"
+          fi
+          COUNT=$(grep -c . "$RUNNER_TEMP/files.txt" || true)
+          COUNT=${COUNT:-0}
+
+          case "$RELEASE_RESULT" in
+            success)   LINE="[Release] 已发布 $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/${VER}" ;;
+            failure)   LINE="[Release] 发布失败，详见 Actions 日志" ;;
+            cancelled) LINE="[Release] 发布被取消" ;;
+            *)         LINE="[Release] 未发布" ;;
+          esac
+
+          {
+            case "$BUILD_RESULT" in
+              success)   printf '[%s] 构建成功 %s\n' "$PROJECT_NAME" "$VER" ;;
+              cancelled) printf '[%s] 构建被取消 %s\n' "$PROJECT_NAME" "$VER" ;;
+              *)         printf '[%s] 构建失败 %s\n' "$PROJECT_NAME" "$VER" ;;
+            esac
+            printf '[仓库] %s\n' "$GITHUB_REPOSITORY"
+            printf '[分支/Tag] %s\n' "$GITHUB_REF_NAME"
+            printf '[Commit] %s\n' "$SHORT_SHA"
+            printf '[产物数量] %s\n' "$COUNT"
+            printf '%s\n' "$LINE"
+            if [ "$BUILD_RESULT" = "success" ]; then
+              printf '[Actions构建与产物下载] %s' "$RUN_URL"
+            else
+              printf '[失败日志] %s' "$RUN_URL"
+            fi
+          } > "$RUNNER_TEMP/msg4.txt"
+
+          : > "$RUNNER_TEMP/msg5.txt"
+          if [ "$COUNT" -gt 0 ]; then
+            {
+              printf '[%s] 构建产物 %s\n' "$PROJECT_NAME" "$VER"
+              awk '{
+                cmd="stat -c%s \"" $0 "\""; cmd | getline sz; close(cmd)
+                n=$0; sub(/.*\//,"",n)
+                printf "- %s (%.2f MB)\n", n, sz/1048576
+              }' "$RUNNER_TEMP/files.txt"
+              printf '[Actions构建与产物下载] %s' "$RUN_URL"
+            } > "$RUNNER_TEMP/msg5.txt"
           fi
 
-          STATUS="${{ needs.build.result }}"
-          if [ "$STATUS" = "success" ]; then
-            TEXT="[Delta Bypass for Rust] 代码更新与自动构建成功"
-          else
-            TEXT="[Delta Bypass for Rust] 代码更新与自动构建失败"
+      - name: 推送消息④⑤
+        continue-on-error: true
+        shell: bash
+        env:
+          AB_URL: ${{ secrets.ASTRBOT_URL }}
+          AB_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
+          AB_TARGETS: ${{ secrets.QQ_TARGET_ID }}
+          AB_PLATFORM: ${{ vars.ASTRBOT_PLATFORM_ID }}
+          AB_MSG_TYPE: ${{ vars.ASTRBOT_MSG_TYPE }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SEND_FILES: ${{ vars.ASTRBOT_SEND_FILES }}
+        run: |
+          printf '%s\n' "$NOTIFY_SCRIPT" > "$RUNNER_TEMP/send.sh"
+
+          AB_TEXT="$(cat "$RUNNER_TEMP/msg4.txt")" bash "$RUNNER_TEMP/send.sh" \
+            || echo "::warning::消息 4 推送失败"
+
+          if [ "$BUILD_RESULT" = "success" ] && [ -s "$RUNNER_TEMP/msg5.txt" ] \
+             && [ "${SEND_FILES:-true}" != "false" ]; then
+            AB_TEXT="$(cat "$RUNNER_TEMP/msg5.txt")" \
+            AB_FILES="$(cat "$RUNNER_TEMP/files.txt")" \
+              bash "$RUNNER_TEMP/send.sh" || echo "::warning::消息 5 推送失败"
           fi
-          
-          REPO="${{ github.repository }}"
-          BRANCH="${{ github.ref_name }}"
-          SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "${{ github.sha }}")
-          COMMIT_MSG=$(git log -1 --pretty=format:"%s" 2>/dev/null || echo "${{ github.event.head_commit.message }}")
-          COMMITTER=$(git log -1 --pretty=format:"%an" 2>/dev/null || echo "${{ github.actor }}")
-          
-          CARGO_VER=$(grep '^version =' Cargo.toml | head -n1 | cut -d '"' -f2 || echo "1.0.0")
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VER="${{ github.ref_name }}"
-          else
-            VER="v${CARGO_VER}"
-          fi
-          
-          CHANGED_FILES=$(git diff-tree --no-commit-id --name-status -r HEAD 2>/dev/null | head -n 15)
-          if [ -z "$CHANGED_FILES" ]; then
-            CHANGED_FILES="无文件变更"
-          fi
-          
-          COMMIT_URL="https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          
-          ARTIFACT_INFO=$(printf "[构建产物清单 (%s)]\n- Windows x64: delta-bypass-%s-windows-amd64.exe\n- Linux x64: delta-bypass-%s-linux-amd64\n- Linux Musl x64: delta-bypass-%s-linux-musl-amd64" "$VER" "$VER" "$VER" "$VER")
-          
-          MSG=$(printf "%s\n[仓库] %s\n[版本] %s\n[分支/Tag] %s\n[提交者] %s\n[Commit] %s\n[提交说明] %s\n\n检测到代码发生更改，具体变更的文件列表如下：\n%s\n\n%s\n\n[Actions构建与产物下载] %s\n[Commit详情] %s" "$TEXT" "$REPO" "$VER" "$BRANCH" "$COMMITTER" "$SHORT_SHA" "$COMMIT_MSG" "$CHANGED_FILES" "$ARTIFACT_INFO" "$RUN_URL" "$COMMIT_URL")
-          
-          FILES_ENDPOINT=$(echo "$BASE_URL" | sed 's|/api/v1/im/messages|/api/v1/files|')
-          
-          MSG_PARTS=$(jq -n --arg txt "$MSG" '[{type: "text", text: $txt}]')
-          
-          rm -f /tmp/uploaded_fids.txt
-          find artifacts -type f | sort | while read -r filepath; do
-            if [ -f "$filepath" ]; then
-              UPLOAD_RES=$(curl -s -X POST "$FILES_ENDPOINT" \
-                -H "Authorization: Bearer ${{ secrets.ASTRBOT_TOKEN }}" \
-                -F "file=@$filepath" || true)
-              FID=$(echo "$UPLOAD_RES" | jq -r '.data.attachment_id // .attachment_id // empty' 2>/dev/null || true)
-              if [ -n "$FID" ]; then
-                echo "$FID" >> /tmp/uploaded_fids.txt
-              fi
-            fi
-          done
-          
-          if [ -f /tmp/uploaded_fids.txt ]; then
-            while read -r fid; do
-              if [ -n "$fid" ]; then
-                MSG_PARTS=$(echo "$MSG_PARTS" | jq --arg fid "$fid" '. + [{type: "file", attachment_id: $fid}]')
-              fi
-            done < /tmp/uploaded_fids.txt
-          fi
-          
-          # 支持使用英文逗号分割多个推送目标（同时推送个人 QQ 和 QQ 群）
-          IFS=',' read -ra TARGETS <<< "${{ secrets.QQ_TARGET_ID }}"
-          for target_item in "${TARGETS[@]}"; do
-            target=$(echo "$target_item" | xargs)
-            if [ -n "$target" ]; then
-              payload=$(jq -n \
-                --argjson msg_parts "$MSG_PARTS" \
-                --arg target "$target" \
-                '{umo: $target, target_id: $target, message: $msg_parts}')
-              
-              curl -s -X POST "${{ secrets.ASTRBOT_URL }}" \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer ${{ secrets.ASTRBOT_TOKEN }}" \
-                -d "$payload" || true
-            fi
-          done
