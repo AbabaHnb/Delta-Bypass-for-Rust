@@ -158,26 +158,9 @@ jobs:
           COMMIT_URL="https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           
-          ARTIFACT_INFO="[构建产物清单 (${VER})]
-- Windows x64: delta-bypass-${VER}-windows-amd64.exe
-- Linux x64: delta-bypass-${VER}-linux-amd64
-- Linux Musl x64: delta-bypass-${VER}-linux-musl-amd64"
+          ARTIFACT_INFO=$(printf "[构建产物清单 (%s)]\n- Windows x64: delta-bypass-%s-windows-amd64.exe\n- Linux x64: delta-bypass-%s-linux-amd64\n- Linux Musl x64: delta-bypass-%s-linux-musl-amd64" "$VER" "$VER" "$VER" "$VER")
           
-          MSG="${TEXT}
-[仓库] ${REPO}
-[版本] ${VER}
-[分支/Tag] ${BRANCH}
-[提交者] ${COMMITTER}
-[Commit] ${SHORT_SHA}
-[提交说明] ${COMMIT_MSG}
-
-检测到代码发生更改，具体变更的文件列表如下：
-${CHANGED_FILES}
-
-${ARTIFACT_INFO}
-
-[Actions构建与产物下载] ${RUN_URL}
-[Commit详情] ${COMMIT_URL}"
+          MSG=$(printf "%s\n[仓库] %s\n[版本] %s\n[分支/Tag] %s\n[提交者] %s\n[Commit] %s\n[提交说明] %s\n\n检测到代码发生更改，具体变更的文件列表如下：\n%s\n\n%s\n\n[Actions构建与产物下载] %s\n[Commit详情] %s" "$TEXT" "$REPO" "$VER" "$BRANCH" "$COMMITTER" "$SHORT_SHA" "$COMMIT_MSG" "$CHANGED_FILES" "$ARTIFACT_INFO" "$RUN_URL" "$COMMIT_URL")
           
           FILES_ENDPOINT=$(echo "$BASE_URL" | sed 's|/api/v1/im/messages|/api/v1/files|')
           
