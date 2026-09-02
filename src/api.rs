@@ -132,7 +132,23 @@ fn load_remembered() -> HashMap<String, Remembered> {
     for (name, record) in table {
         let Some(fields) = record.as_object() else { continue };
 
-        let when = fields.get("ts").and_then(Value::as_u64).unwrap_or(0);
+        // 时间戳要按小数读再取整。
+        //
+        // 线上 Python 版写进去的是带小数的秒（比如 1788249467.7546496），用整数方式
+        // 读会直接读不出来 —— 那样接管服务时现有的上千条记录会全部作废，白白重跑。
+        //
+        // Read the timestamp as a decimal and round it down.
+        //
+        // The production Python version writes seconds with a fraction (1788249467.7546496
+        // for instance), and reading that as a whole number simply fails — which would
+        // throw away the thousands of existing records when taking over the service, and
+        // rerun them all for nothing.
+        let when = fields
+            .get("ts")
+            .and_then(Value::as_f64)
+            .map(|t| t as u64)
+            .unwrap_or(0);
+
         if now.saturating_sub(when) >= config::CACHE_TTL.as_secs() {
             continue;
         }
@@ -255,13 +271,12 @@ struct Params {
 /// 拼回话。
 ///
 /// 字段跟原来的 Python 版保持一致，方便直接替换：`key` `cached` `error` `made_by`
-/// `qq_group` `times`。这版先不带赞助者名单。
+/// `qq_group` `times`。
 ///
 /// Build the reply.
 ///
 /// The fields match the original Python version so it can be swapped in directly:
-/// `key`, `cached`, `error`, `made_by`, `qq_group`, `times`. This version leaves the
-/// sponsor list out for now.
+/// `key`, `cached`, `error`, `made_by`, `qq_group`, `times`.
 fn reply(key: Option<String>, from_memory: bool, error: Option<String>, took: f64) -> Value {
     json!({
         "key": key,
@@ -515,6 +530,32 @@ mod tests {
 
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back.get("abc").unwrap().key, "FREE_xyz");
+    }
+
+    #[test]
+    fn 能读旧版带小数的时间戳_reads_the_old_fractional_timestamp() {
+        // 线上 Python 版写的 ts 带小数。接管服务时必须能读，否则上千条记录白丢。
+        // The production Python version writes ts with a fraction. Taking over the
+        // service has to read that, or thousands of records are thrown away.
+        let dir = tempfile::tempdir().expect("临时目录 / temp dir");
+        let here = std::env::current_dir().expect("当前目录 / current dir");
+        std::env::set_current_dir(dir.path()).expect("换目录 / change dir");
+
+        let now = now_secs();
+        let python_style = format!(
+            r#"{{"abc":{{"key":"FREE_python","ts":{}.7546496,"solve_time":6.812400085}}}}"#,
+            now
+        );
+        std::fs::write(config::CACHE_FILE, python_style).expect("写文件 / write file");
+
+        let read_back = load_remembered();
+
+        std::env::set_current_dir(here).expect("回原目录 / change back");
+
+        assert_eq!(read_back.len(), 1, "带小数的时间戳应该能读出来 / a fractional timestamp should load");
+        let record = read_back.get("abc").expect("应该有这条 / the record should be there");
+        assert_eq!(record.key, "FREE_python");
+        assert_eq!(record.when, now, "小数部分应该被去掉 / the fraction should be dropped");
     }
 
     #[test]
