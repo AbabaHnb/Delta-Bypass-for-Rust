@@ -58,7 +58,7 @@ env:
         PLAT="$BOTS"
         echo "只有一个平台实例，自动使用 $PLAT"
       elif [ "${N:-0}" -gt 1 ]; then
-        echo "::error::AstrBot 有 $N 个平台实例，必须用仓库变量 ASTRBOT_PLATFORM_ID 指定一个：$(printf '%s' "$BOTS" | tr '\n' ' ')"
+        echo "::error::AstrBot 有 $N 个平台实例，必须配置 ASTRBOT_PLATFORM_ID（Variables 或 Secrets 都可）指定一个：$(printf '%s' "$BOTS" | tr '\n' ' ')"
         exit 1
       else
         PLAT=aiocqhttp
@@ -217,8 +217,8 @@ jobs:
           AB_URL: ${{ secrets.ASTRBOT_URL }}
           AB_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
           AB_TARGETS: ${{ secrets.QQ_TARGET_ID }}
-          AB_PLATFORM: ${{ vars.ASTRBOT_PLATFORM_ID }}
-          AB_MSG_TYPE: ${{ vars.ASTRBOT_MSG_TYPE }}
+          AB_PLATFORM: ${{ vars.ASTRBOT_PLATFORM_ID || secrets.ASTRBOT_PLATFORM_ID }}
+          AB_MSG_TYPE: ${{ vars.ASTRBOT_MSG_TYPE || secrets.ASTRBOT_MSG_TYPE }}
         run: |
           printf '%s\n' "$NOTIFY_SCRIPT" > "$RUNNER_TEMP/send.sh"
           for i in 1 2 3; do
@@ -397,10 +397,10 @@ jobs:
           AB_URL: ${{ secrets.ASTRBOT_URL }}
           AB_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
           AB_TARGETS: ${{ secrets.QQ_TARGET_ID }}
-          AB_PLATFORM: ${{ vars.ASTRBOT_PLATFORM_ID }}
-          AB_MSG_TYPE: ${{ vars.ASTRBOT_MSG_TYPE }}
+          AB_PLATFORM: ${{ vars.ASTRBOT_PLATFORM_ID || secrets.ASTRBOT_PLATFORM_ID }}
+          AB_MSG_TYPE: ${{ vars.ASTRBOT_MSG_TYPE || secrets.ASTRBOT_MSG_TYPE }}
           BUILD_RESULT: ${{ needs.build.result }}
-          SEND_FILES: ${{ vars.ASTRBOT_SEND_FILES }}
+          SEND_FILES: ${{ vars.ASTRBOT_SEND_FILES || secrets.ASTRBOT_SEND_FILES }}
         run: |
           printf '%s\n' "$NOTIFY_SCRIPT" > "$RUNNER_TEMP/send.sh"
 
