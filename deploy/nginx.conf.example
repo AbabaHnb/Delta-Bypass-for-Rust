@@ -1,0 +1,52 @@
+# Delta 绕过器的 nginx 配置示例
+# Example nginx setup for the Delta bypass service
+#
+# 要点：程序自己没有任何验证，所以口令和限速必须在这一层加上。
+# The point: the program has no authentication of its own, so the password and rate
+# limit have to go on at this layer.
+
+# 按来访地址限速。放在 http 段里，不是 server 段。
+# Rate limit per visiting address. This goes in the http block, not the server block.
+limit_req_zone $binary_remote_addr zone=delta:10m rate=10r/s;
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.example;
+
+    ssl_certificate     /etc/letsencrypt/live/your-domain.example/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.example/privkey.pem;
+
+    location /delta {
+        # 限速：平时每秒 10 个，突发允许攒到 20 个，超了直接拒
+        # Rate limit: 10 a second normally, bursts up to 20, anything past that refused
+        limit_req zone=delta burst=20 nodelay;
+
+        # 口令。先建好文件：htpasswd -c /etc/nginx/.htpasswd 用户名
+        # Password. Make the file first: htpasswd -c /etc/nginx/.htpasswd username
+        auth_basic "delta";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+
+        proxy_pass http://127.0.0.1:2233;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 一条链接要跑 6 秒左右，等待时间给足，别中途掐断
+        # One link takes around 6 seconds, so allow plenty of waiting rather than cutting
+        # it off midway
+        proxy_read_timeout    120s;
+        proxy_connect_timeout 10s;
+
+        # 返回内容不大，不用缓冲，直接透传更快
+        # The reply is small, so passing it straight through beats buffering
+        proxy_buffering off;
+    }
+
+    # 别把其他路径也代理进去 —— 程序只有 /delta 一个接口
+    # Do not proxy anything else — the program has only the one /delta endpoint
+    location / {
+        return 404;
+    }
+}

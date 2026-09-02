@@ -1,0 +1,21 @@
+# 编译产物 / build output
+/target
+
+# 记下来的钥匙，跑起来才有，不该进版本库
+# Remembered keys: created at runtime, should not be committed
+.key_cache.json
+.key_cache.json.tmp
+
+# Windows 服务日志（用 NSSM 时会生成）
+# Windows service logs, created when using NSSM
+out.log
+err.log
+
+# 编辑器和系统的杂七杂八 / editor and system clutter
+*.swp
+*.swo
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

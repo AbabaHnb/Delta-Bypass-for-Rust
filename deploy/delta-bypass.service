@@ -1,0 +1,44 @@
+[Unit]
+Description=Delta 绕过器 / Delta bypass service
+Documentation=https://github.com/AbabaHnb/Delta-bypass
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 别用 root 跑 / do not run as root
+User=www
+Group=www
+
+# 工作目录要可写，记下来的钥匙存这儿
+# The working directory must be writable; remembered keys live here
+WorkingDirectory=/opt/delta-bypass
+
+# 只监听本机，外面用 nginx 之类转发进来并加上验证
+# Listen locally only; put nginx or similar in front with authentication
+ExecStart=/opt/delta-bypass/delta-bypass \
+    --serve \
+    --host 127.0.0.1 \
+    --port 2233 \
+    --prepared 30
+
+Restart=always
+RestartSec=5
+
+# 高并发时文件句柄要够 / enough file handles for heavy load
+LimitNOFILE=65535
+
+# 收紧权限：只让它写工作目录，其他地方一概不能动
+# Tighten permissions: it may write only its working directory, nothing else
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/delta-bypass
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
