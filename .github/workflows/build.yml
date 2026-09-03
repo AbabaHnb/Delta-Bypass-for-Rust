@@ -132,6 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.info.outputs.version }}
+      announce: ${{ steps.info.outputs.announce }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -170,6 +171,16 @@ jobs:
           fi
           TOTAL=$(grep -c . "$RUNNER_TEMP/raw.txt" || true)
           TOTAL=${TOTAL:-0}
+
+          NON_CI=$(awk -F'\t' 'NF>=2 && $2 !~ /^\.github\// {c++} END {print c+0}' "$RUNNER_TEMP/raw.txt")
+          if [ "$GITHUB_EVENT_NAME" != push ] || [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "announce=true" >> "$GITHUB_OUTPUT"
+          elif [ "$TOTAL" -gt 0 ] && [ "$NON_CI" = 0 ]; then
+            echo "announce=false" >> "$GITHUB_OUTPUT"
+            echo "本次只改了 .github/ 下的文件，跳过 QQ 推送与 Release。"
+          else
+            echo "announce=true" >> "$GITHUB_OUTPUT"
+          fi
           awk -F'\t' 'NF>=2 {
             s=substr($1,1,1)
             if (s=="A") n="新增"; else if (s=="M") n="修改";
@@ -210,7 +221,7 @@ jobs:
           } > "$RUNNER_TEMP/msg3.txt"
 
       - name: 推送消息①②③
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.info.outputs.announce == 'true'
         continue-on-error: true
         shell: bash
         env:
@@ -297,7 +308,7 @@ jobs:
     name: Create GitHub Release
     needs: [ notify-start, build ]
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.release)
+    if: needs.notify-start.outputs.announce == 'true' && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.release)
     permissions:
       contents: write
     steps:
@@ -323,7 +334,7 @@ jobs:
   notify-result:
     name: 通知：构建结果与产物
     needs: [ notify-start, build, release ]
-    if: always() && github.event_name != 'pull_request'
+    if: always() && needs.notify-start.outputs.announce == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
