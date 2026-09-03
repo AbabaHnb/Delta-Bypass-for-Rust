@@ -283,7 +283,9 @@ fn bypass_links(options: &Options) {
 
         urls.iter().map(|u| auth::extract_ticket(u)).collect()
     } else if let Some(given) = &options.target {
-        vec![auth::extract_ticket(given)]
+        // 命令行参数才允许从文件读凭据（一行一条那种）。
+        // Only a command line argument may read credentials from a file (one per line).
+        vec![auth::extract_ticket_from_arg(given)]
     } else {
         let _ = Options::command().print_help();
         std::process::exit(1);

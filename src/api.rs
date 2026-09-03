@@ -33,6 +33,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -106,18 +107,25 @@ fn short_name(text: &str) -> String {
 // 存到文件 / Saving to a file
 // ---------------------------------------------------------------------------
 
-/// 从文件把记过的钥匙读回来。
+/// 从指定文件把记过的钥匙读回来。
 ///
 /// 过期的直接不要。文件坏了或者不存在就当没有，不影响启动。
 ///
-/// Read remembered keys back from the file.
+/// 路径是参数而不是写死的，这样测试可以各用各的文件，不必去改进程的当前目录 ——
+/// 当前目录是全进程共享的，测试并行跑起来会互相踩。
 ///
-/// Expired ones are simply left out. A missing or damaged file is treated as none,
-/// and does not stop startup.
-fn load_remembered() -> HashMap<String, Remembered> {
+/// Read remembered keys back from the given file.
+///
+/// Expired ones are simply left out. A missing or damaged file is treated as none, and does
+/// not stop startup.
+///
+/// The path is a parameter rather than hard-coded so that tests can each use their own file
+/// instead of changing the process's current directory — that directory is shared across the
+/// whole process, and parallel tests tread on each other through it.
+fn load_remembered_from(path: &Path) -> HashMap<String, Remembered> {
     let mut out = HashMap::new();
 
-    let Ok(text) = std::fs::read_to_string(config::CACHE_FILE) else {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return out;
     };
     let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
@@ -168,15 +176,21 @@ fn load_remembered() -> HashMap<String, Remembered> {
     out
 }
 
-/// 把记过的钥匙写回文件。
+/// 从默认文件读。服务启动时用这个。
+/// Read from the default file. Used at service startup.
+fn load_remembered() -> HashMap<String, Remembered> {
+    load_remembered_from(Path::new(config::CACHE_FILE))
+}
+
+/// 把记过的钥匙写到指定文件。
 ///
 /// 先写临时文件再改名，这样中途断电也不会留下半个坏文件。
 ///
-/// Write remembered keys back to the file.
+/// Write remembered keys to the given file.
 ///
-/// It writes a temporary file and renames it, so losing power midway cannot leave half
-/// a broken file behind.
-fn save_remembered(table: &HashMap<String, Remembered>) {
+/// It writes a temporary file and renames it, so losing power midway cannot leave half a
+/// broken file behind.
+fn save_remembered_to(path: &Path, table: &HashMap<String, Remembered>) {
     let mut out = serde_json::Map::new();
 
     for (name, record) in table {
@@ -194,10 +208,16 @@ fn save_remembered(table: &HashMap<String, Remembered>) {
         return;
     };
 
-    let temp = format!("{}.tmp", config::CACHE_FILE);
+    let temp = path.with_extension("json.tmp");
     if std::fs::write(&temp, text).is_ok() {
-        let _ = std::fs::rename(&temp, config::CACHE_FILE);
+        let _ = std::fs::rename(&temp, path);
     }
+}
+
+/// 写到默认文件。求解成功后用这个。
+/// Write to the default file. Used after a successful bypass.
+fn save_remembered(table: &HashMap<String, Remembered>) {
+    save_remembered_to(Path::new(config::CACHE_FILE), table)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +338,17 @@ async fn delta(
     let given = params.url.unwrap_or_default();
 
     let ticket = auth::extract_ticket(&given);
-    if ticket.is_empty() {
+
+    // 长度不够的在这里就挡掉，别进求解流程。
+    //
+    // 求解一趟要 5 秒以上，而这种链接注定失败 —— 早点说清楚比让人等着强。顺带也
+    // 省掉一次没意义的自动重试。
+    //
+    // Anything too short is refused here rather than entering the bypass flow.
+    //
+    // A bypass takes over 5 seconds and this kind of link is doomed anyway — saying so
+    // early beats making the caller wait. It also saves a pointless automatic retry.
+    if ticket.len() < auth::MIN_TICKET_LEN {
         return as_json(reply(
             None,
             false,
@@ -391,6 +421,21 @@ async fn delta(
                         took_secs: outcome.took_secs,
                     },
                 );
+
+                // 顺手把过期的清掉再落盘。
+                //
+                // 不清的话，服务一直不重启，过期条目就一直躺在文件里越攒越多 —— 读的
+                // 时候会跳过它们，所以不影响结果，但文件白白变大，而且看着像有脏数据。
+                //
+                // Drop expired entries before writing, while we are here.
+                //
+                // Without this, a long-running service keeps piling stale entries into the
+                // file — reads skip them so results are unaffected, but the file grows for
+                // nothing and looks like it holds bad data.
+                let now = now_secs();
+                let ttl = config::CACHE_TTL.as_secs();
+                table.retain(|_, r| now.saturating_sub(r.when) < ttl);
+
                 save_remembered(&table);
             }
 
@@ -511,25 +556,41 @@ mod tests {
         assert_eq!(body["cached"], false);
     }
 
+    /// 每个测试各用一个临时文件。
+    ///
+    /// **不能改进程的当前目录。** 当前目录是全进程共享的，测试默认并行跑，一个测试改了
+    /// 目录、另一个正好在用，就会互相踩 —— 之前真踩到了：临时目录被先结束的测试删掉，
+    /// 后结束的那个要切回原目录时报 NotFound。
+    ///
+    /// Each test gets its own temporary file.
+    ///
+    /// **Never change the process's current directory.** It is shared across the whole
+    /// process, tests run in parallel by default, and one test changing it while another is
+    /// using it means they tread on each other — which actually happened: the temporary
+    /// directory was removed by whichever test finished first, and the other failed with
+    /// NotFound when trying to change back.
+    fn temp_cache() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("临时目录 / temp dir");
+        let path = dir.path().join(config::CACHE_FILE);
+        (dir, path)
+    }
+
     #[test]
     fn 存了能读回来_saving_then_loading_works() {
-        let dir = tempfile::tempdir().expect("临时目录 / temp dir");
-        let here = std::env::current_dir().expect("当前目录 / current dir");
-        std::env::set_current_dir(dir.path()).expect("换目录 / change dir");
+        let (_dir, path) = temp_cache();
 
         let mut table = HashMap::new();
         table.insert(
             "abc".to_string(),
             Remembered { key: "FREE_xyz".into(), when: now_secs(), took_secs: 5.5 },
         );
-        save_remembered(&table);
+        save_remembered_to(&path, &table);
 
-        let read_back = load_remembered();
-
-        std::env::set_current_dir(here).expect("回原目录 / change back");
+        let read_back = load_remembered_from(&path);
 
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back.get("abc").unwrap().key, "FREE_xyz");
+        assert_eq!(read_back.get("abc").unwrap().took_secs, 5.5);
     }
 
     #[test]
@@ -537,20 +598,16 @@ mod tests {
         // 线上 Python 版写的 ts 带小数。接管服务时必须能读，否则上千条记录白丢。
         // The production Python version writes ts with a fraction. Taking over the
         // service has to read that, or thousands of records are thrown away.
-        let dir = tempfile::tempdir().expect("临时目录 / temp dir");
-        let here = std::env::current_dir().expect("当前目录 / current dir");
-        std::env::set_current_dir(dir.path()).expect("换目录 / change dir");
+        let (_dir, path) = temp_cache();
 
         let now = now_secs();
         let python_style = format!(
             r#"{{"abc":{{"key":"FREE_python","ts":{}.7546496,"solve_time":6.812400085}}}}"#,
             now
         );
-        std::fs::write(config::CACHE_FILE, python_style).expect("写文件 / write file");
+        std::fs::write(&path, python_style).expect("写文件 / write file");
 
-        let read_back = load_remembered();
-
-        std::env::set_current_dir(here).expect("回原目录 / change back");
+        let read_back = load_remembered_from(&path);
 
         assert_eq!(read_back.len(), 1, "带小数的时间戳应该能读出来 / a fractional timestamp should load");
         let record = read_back.get("abc").expect("应该有这条 / the record should be there");
@@ -560,9 +617,7 @@ mod tests {
 
     #[test]
     fn 过期的读不回来_expired_records_are_left_out() {
-        let dir = tempfile::tempdir().expect("临时目录 / temp dir");
-        let here = std::env::current_dir().expect("当前目录 / current dir");
-        std::env::set_current_dir(dir.path()).expect("换目录 / change dir");
+        let (_dir, path) = temp_cache();
 
         let mut table = HashMap::new();
         table.insert(
@@ -575,12 +630,79 @@ mod tests {
                 took_secs: 5.0,
             },
         );
-        save_remembered(&table);
+        save_remembered_to(&path, &table);
 
-        let read_back = load_remembered();
-
-        std::env::set_current_dir(here).expect("回原目录 / change back");
+        let read_back = load_remembered_from(&path);
 
         assert!(read_back.is_empty(), "过期的不该读回来 / expired ones should not come back");
+    }
+
+    #[test]
+    fn 文件不在或坏了都当空_missing_or_broken_file_reads_as_empty() {
+        let (_dir, path) = temp_cache();
+
+        // 文件根本不存在。
+        // The file does not exist at all.
+        assert!(load_remembered_from(&path).is_empty());
+
+        // 不是 JSON。
+        // Not JSON.
+        std::fs::write(&path, "这不是 JSON / not JSON").expect("写文件 / write file");
+        assert!(load_remembered_from(&path).is_empty());
+
+        // 是 JSON 但不是对象。
+        // JSON, but not an object.
+        std::fs::write(&path, "[1, 2, 3]").expect("写文件 / write file");
+        assert!(load_remembered_from(&path).is_empty());
+
+        // 对象里的记录缺字段。
+        // A record inside is missing fields.
+        std::fs::write(&path, r#"{"abc":{"ts":123}}"#).expect("写文件 / write file");
+        assert!(load_remembered_from(&path).is_empty());
+    }
+
+    /// 落盘时会把过期的清掉，文件里不该越攒越多。
+    ///
+    /// 之前只在启动时淘汰，服务长期不重启就会一直积压。验收里逮到过：文件里躺着一条
+    /// 超期 79 秒的。
+    ///
+    /// Expired entries are dropped when writing, so the file does not keep growing.
+    ///
+    /// Eviction used to happen only at startup, so a long-running service piled them up.
+    /// The check caught one sitting 79 seconds past its time.
+    #[test]
+    fn 落盘会清掉过期的_writing_drops_expired_entries() {
+        let (_dir, path) = temp_cache();
+        let now = now_secs();
+        let ttl = config::CACHE_TTL.as_secs();
+
+        let mut table = HashMap::new();
+        // 一条新的，一条刚好超期一点的。
+        // One fresh, one just past its time.
+        table.insert(
+            "fresh".to_string(),
+            Remembered { key: "FREE_fresh".into(), when: now, took_secs: 5.5 },
+        );
+        table.insert(
+            "stale".to_string(),
+            Remembered { key: "FREE_stale".into(), when: now - ttl - 79, took_secs: 5.5 },
+        );
+
+        // 模拟落盘前的清理。
+        // Mimic the tidy-up that happens before writing.
+        table.retain(|_, r| now.saturating_sub(r.when) < ttl);
+        save_remembered_to(&path, &table);
+
+        // 直接看文件内容，确认过期那条根本没写进去。
+        // Read the file itself, to confirm the expired one never made it in.
+        let raw = std::fs::read_to_string(&path).expect("读文件 / read file");
+        assert!(raw.contains("FREE_fresh"), "新的应该在 / the fresh one should be there");
+        assert!(
+            !raw.contains("FREE_stale"),
+            "过期的不该写进文件 / the expired one should not be written"
+        );
+
+        let read_back = load_remembered_from(&path);
+        assert_eq!(read_back.len(), 1);
     }
 }

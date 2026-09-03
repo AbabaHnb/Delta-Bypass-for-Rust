@@ -87,17 +87,24 @@ pub fn now_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// 抠出通行串 / Pulling out the pass string
+// 抠出通行凭据 / Pulling out the pass credential
 // ---------------------------------------------------------------------------
 
-/// 从输入里把通行串找出来。
+/// 从输入里把通行凭据找出来。**不读任何文件。**
 ///
-/// 支持三种给法：完整网址（取 `d=` 后面那段）、直接一串、或者一个文件路径。
+/// 支持两种给法：完整网址（取 `d=` 后面那段），或者直接一串。
 ///
-/// Find the pass string in whatever was given.
+/// 网页接口一律用这个 —— 外面传进来的东西不能拿去碰服务器上的文件。想从文件读的
+/// 走 [`extract_ticket_from_arg`]，那是命令行专用的。
 ///
-/// Three forms work: a full web address (take what follows `d=`), the string on
-/// its own, or a path to a file.
+/// Find the pass credential in the given input. **Reads no files.**
+///
+/// Two forms work: a full web address (take what follows `d=`), or the credential on its
+/// own.
+///
+/// The web interface always uses this — something handed in from outside must not be able
+/// to touch files on the server. To read from a file use [`extract_ticket_from_arg`], which
+/// is for the command line only.
 pub fn extract_ticket(input: &str) -> String {
     let text = input.trim();
 
@@ -116,13 +123,40 @@ pub fn extract_ticket(input: &str) -> String {
         return text.to_string();
     }
 
-    // 看着像路径就当文件读，读到内容再递归处理一次。
-    // If it looks like a path, read it as a file and process the contents again.
+    text.to_string()
+}
+
+/// 命令行专用：跟 [`extract_ticket`] 一样，但看着像路径时会当文件读。
+///
+/// **只给命令行参数用。** 网页接口绝对不能调这个 —— 那等于让任何能访问接口的人指定
+/// 服务器上的文件路径。虽然文件内容不会直接回显给调用方，但会被当成凭据发到上游去，
+/// 而且「文件存在」和「文件不存在」的返回耗时差着几万倍，足够拿来探测服务器上有什么。
+///
+/// For the command line only: same as [`extract_ticket`], but reads a file when the input
+/// looks like a path.
+///
+/// **Command line arguments only.** The web interface must never call this — it would let
+/// anyone who can reach the endpoint name a path on the server. The file's contents are not
+/// echoed back directly, but they do get sent upstream as a credential, and the reply timing
+/// for "file exists" versus "does not exist" differs by four orders of magnitude, which is
+/// quite enough to probe what is on the server.
+pub fn extract_ticket_from_arg(input: &str) -> String {
+    let text = input.trim();
+
+    // 网址和纯凭据先按普通规则处理。
+    // Addresses and bare credentials go through the ordinary rules first.
+    if text.starts_with("http") {
+        return extract_ticket(text);
+    }
+
+    // 看着像路径就当文件读，读到内容再按普通规则处理一次。
+    // If it looks like a path, read it as a file and run the contents through the ordinary
+    // rules.
     if text.ends_with(".txt") || text.contains('/') || text.contains('\\') {
         if let Ok(contents) = std::fs::read_to_string(text) {
             let inner = contents.trim().to_string();
             if !inner.is_empty() {
-                return extract_ticket(&inner);
+                return extract_ticket_from_arg(&inner);
             }
         }
     }
@@ -206,12 +240,57 @@ pub struct Payload {
 ///
 /// The browser note passed in must match the one in the request header. Saying
 /// iPhone in the header and something else inside is an obvious giveaway.
-pub fn build_payload(ticket: &str, when_ms: u64, agent: &str, screen: &str) -> Payload {
+/// 凭据至少要这么长才能切出两组密钥。
+///
+/// 第二组从第 2 个字节起算、取到第 33 个，所以 33 是硬下限。
+///
+/// A credential must be at least this long for two sets of keys to be cut from it.
+///
+/// The second set starts at byte 2 and runs to byte 33, so 33 is the hard minimum.
+pub const MIN_TICKET_LEN: usize = 33;
+
+/// 拼出这两段内容。凭据太短就返回 `None`。
+///
+/// 锁的钥匙就是凭据自己切出来的：前 16 个字节做钥匙、第 17 到 32 个做起始值，
+/// 这是第一段；第二段整体往后挪一个字节。上游就这么定的，位置错一个都过不了。
+///
+/// **返回 `Option` 是必须的。** 以前这里只有一句 `debug_assert!` 检查长度，release
+/// 编译下那句不生效，遇到畸形短凭据就直接切片越界、整个线程崩掉。生产日志里逮到过
+/// 7 次（29 字节、8 字节、1 字节的都有）。崩在工作线程里比返回错误糟得多：调用方看到
+/// 的是莫名失败，还会白白触发一次重试。
+///
+/// 传进来的浏览器说明必须跟请求头里写的那个一样。头里说是 iPhone、内容里写另
+/// 一款，一眼就看出是编的。
+///
+/// Build the two pieces. Returns `None` when the credential is too short.
+///
+/// The lock keys come out of the credential itself: bytes 1 to 16 as the key and 17 to 32
+/// as the starting value for the first piece; the second piece shifts one byte along. That
+/// is how the far end defined it — off by one byte and it fails.
+///
+/// **Returning `Option` is necessary.** This used to check the length with only a
+/// `debug_assert!`, which does nothing in a release build, so a malformed short credential
+/// ran straight off the end of the slice and took the whole thread down. Production logs
+/// caught that 7 times (29 bytes, 8 bytes, even 1 byte). Crashing a worker thread is far
+/// worse than returning an error: the caller sees an unexplained failure and wastes a
+/// retry on it.
+///
+/// The browser note passed in must match the one in the request header. Saying iPhone in
+/// the header and something else inside is an obvious giveaway.
+pub fn build_payload(
+    ticket: &str,
+    when_ms: u64,
+    agent: &str,
+    screen: &str,
+) -> Option<Payload> {
     let bytes = ticket.as_bytes();
-    debug_assert!(
-        bytes.len() >= 33,
-        "凭据长度不足，无法派生密钥 / Credential too short to derive keys from"
-    );
+
+    // 长度不够就不切了。这不是异常情况 —— 外面随手传个乱串就会走到这。
+    // Not long enough, so do not cut. This is not an exceptional case — any stray string
+    // from outside lands here.
+    if bytes.len() < MIN_TICKET_LEN {
+        return None;
+    }
 
     let browser_part = format!(
         r#"{{"browserInfo":[{{"screen":"{}","ua":"{}","time":{}}}]}}"#,
@@ -221,7 +300,7 @@ pub fn build_payload(ticket: &str, when_ms: u64, agent: &str, screen: &str) -> P
     );
     let action_part = format!(r#"{{"events":[{{"event":1,"data":{{"time":{}}}}}]}}"#, when_ms);
 
-    Payload {
+    Some(Payload {
         meta: crypto::to_hex(&crypto::aes_ctr(
             &bytes[0..16],
             &bytes[16..32],
@@ -232,7 +311,7 @@ pub fn build_payload(ticket: &str, when_ms: u64, agent: &str, screen: &str) -> P
             &bytes[17..33],
             action_part.as_bytes(),
         )),
-    }
+    })
 }
 
 /// 把引号之类的字符转义，免得拼出来的内容格式坏掉。
@@ -270,7 +349,19 @@ pub fn submit(ticket: &str, token: &str, service: i64) -> Value {
     // Take the browser note once and use it for both the header and the
     // encrypted content.
     let ua = useragent::next();
-    let payload = build_payload(ticket, now_ms(), ua.agent, ua.screen);
+
+    // 凭据太短就直接说不行，别往上游发。以前这里会切片越界把线程搞崩。
+    // Too short a credential is refused outright rather than sent upstream. This used to
+    // run off the end of the slice and take the thread down.
+    let Some(payload) = build_payload(ticket, now_ms(), ua.agent, ua.screen) else {
+        return json!({
+            "success": false,
+            "error": format!(
+                "凭据长度不足（{} 字节，至少要 {} 字节）/ Credential too short ({} bytes, at least {} needed)",
+                ticket.len(), MIN_TICKET_LEN, ticket.len(), MIN_TICKET_LEN
+            ),
+        });
+    };
 
     let address = format!(
         "{}/session/step?ticket={}&service={}",
@@ -456,7 +547,8 @@ mod tests {
         let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) \
 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Mobile/15E148 Safari/604.1";
 
-        let p = build_payload(ticket, 1_725_234_000_123, agent, "390x844");
+        let p = build_payload(ticket, 1_725_234_000_123, agent, "390x844")
+            .expect("这条凭据够长 / this credential is long enough");
 
         assert_eq!(
             p.meta,
@@ -465,6 +557,87 @@ AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Mobile/15E148 Safari/604
         assert_eq!(
             p.stream,
             "c3a61be34da86f4dcfdffb3ee452a4d715a36c1ea3749e1342d76f6e70279b9e5187b26160843cc05938168777f86b566d5159664963"
+        );
+    }
+
+    /// 短凭据必须返回 None，不能崩。
+    ///
+    /// 这是线上真实踩到的：有人传了 29 字节、8 字节、1 字节的串，切片越界把工作线程
+    /// 打崩了 7 次。逐个长度都试一遍，确保一个都不漏。
+    ///
+    /// A short credential must give None rather than crash.
+    ///
+    /// This actually happened in production: strings of 29, 8 and 1 bytes ran off the end
+    /// of the slice and took a worker thread down 7 times. Every length is tried, so none
+    /// slips through.
+    #[test]
+    fn 短凭据不会崩_a_short_credential_does_not_crash() {
+        let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X)";
+
+        // 0 到 32 字节全试，一个都不能崩，而且都得返回 None。
+        // Every length from 0 to 32: none may crash, and all must give None.
+        for len in 0..MIN_TICKET_LEN {
+            let short = "A".repeat(len);
+            assert!(
+                build_payload(&short, 1_725_234_000_123, agent, "390x844").is_none(),
+                "{} 字节应该返回 None / {} bytes should give None",
+                len,
+                len
+            );
+        }
+
+        // 刚好够长就该正常出结果。
+        // Exactly long enough should work.
+        let just_enough = "A".repeat(MIN_TICKET_LEN);
+        assert!(
+            build_payload(&just_enough, 1_725_234_000_123, agent, "390x844").is_some(),
+            "{} 字节应该能用 / {} bytes should work",
+            MIN_TICKET_LEN,
+            MIN_TICKET_LEN
+        );
+    }
+
+    /// 线上遇到的那三个具体长度，单独钉住。
+    /// The three specific lengths seen in production, pinned down individually.
+    #[test]
+    fn 线上遇到的短凭据长度_the_short_lengths_seen_in_production() {
+        let agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X)";
+        for len in [1usize, 8, 29] {
+            let short = "x".repeat(len);
+            assert!(
+                build_payload(&short, 0, agent, "390x844").is_none(),
+                "线上那个 {} 字节的应该被挡住 / the {}-byte one seen live should be refused",
+                len,
+                len
+            );
+        }
+    }
+
+    /// 短凭据走到 submit 时，应该拿到明确的错误，而不是崩。
+    ///
+    /// 这条不联网 —— 长度检查在发请求之前就返回了。
+    ///
+    /// A short credential reaching submit should come back as a plain error, not a crash.
+    ///
+    /// This does not touch the network — the length check returns before any request goes out.
+    #[test]
+    fn 短凭据提交返回错误_submitting_a_short_credential_returns_an_error() {
+        let reply = submit("tooshort", "sometoken", 3);
+
+        assert_eq!(
+            reply.get("success").and_then(Value::as_bool),
+            Some(false),
+            "应该明确失败 / should plainly fail"
+        );
+
+        let why = reply
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("应该带原因 / should carry a reason");
+        assert!(
+            why.contains("凭据长度不足"),
+            "原因应该说清是长度问题 / the reason should say it is a length problem: {}",
+            why
         );
     }
 
@@ -479,14 +652,69 @@ AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Mobile/15E148 Safari/604
     }
 
     #[test]
-    fn 从文件读也行_reads_from_a_file() {
+    fn 命令行才能从文件读_only_the_command_line_reads_files() {
         use std::io::Write;
         let dir = tempfile::tempdir().expect("临时目录 / temp dir");
         let path = dir.path().join("ticket.txt");
         let mut f = std::fs::File::create(&path).expect("建文件 / create file");
         writeln!(f, "FROMFILE123").expect("写文件 / write file");
+        let as_text = path.to_str().unwrap();
 
-        assert_eq!(extract_ticket(path.to_str().unwrap()), "FROMFILE123");
+        // 命令行那个会读文件。
+        // The command line one reads the file.
+        assert_eq!(extract_ticket_from_arg(as_text), "FROMFILE123");
+
+        // 网页接口用的那个不读 —— 原样返回路径本身。
+        // The one used by the web interface does not — it hands the path straight back.
+        assert_eq!(
+            extract_ticket(as_text),
+            as_text,
+            "接口用的那个不该去读文件 / the interface one must not read files"
+        );
+    }
+
+    /// 接口不能被拿去探服务器上的文件。
+    ///
+    /// 修之前：传 `/etc/hostname` 这种路径，程序真去读了，把内容当凭据发上游。虽然
+    /// 内容不直接回显，但「文件在」和「文件不在」的返回耗时差着几万倍（1.19 秒 vs
+    /// 0.00005 秒），足够拿来一个个试出服务器上有什么。
+    ///
+    /// The interface must not become a way to probe files on the server.
+    ///
+    /// Before the fix: hand it a path like `/etc/hostname` and the program actually read it,
+    /// sending the contents upstream as a credential. The contents are not echoed back, but
+    /// the reply timing for "file exists" versus "does not" differed by four orders of
+    /// magnitude (1.19s versus 0.00005s) — quite enough to work out what is there, one guess
+    /// at a time.
+    #[test]
+    fn 接口不会读服务器文件_the_interface_does_not_read_server_files() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("临时目录 / temp dir");
+        let path = dir.path().join("secret.txt");
+        let mut f = std::fs::File::create(&path).expect("建文件 / create file");
+        // 写够长，好让「读到了」和「没读到」能区分开。
+        // Long enough that "read it" and "did not" can be told apart.
+        writeln!(f, "{}", "S".repeat(60)).expect("写文件 / write file");
+        let as_text = path.to_str().unwrap();
+
+        let got = extract_ticket(as_text);
+        assert_eq!(got, as_text, "应该原样返回路径 / should hand the path back as-is");
+        assert!(
+            !got.contains("SSSS"),
+            "文件内容绝对不能出现在结果里 / file contents must never appear in the result"
+        );
+
+        // 几个常见的探测写法都试一遍。
+        // Try the usual probing shapes.
+        for probe in ["/etc/hostname", "../../etc/passwd", "/etc/shadow", "C:\\Windows\\win.ini"] {
+            assert_eq!(
+                extract_ticket(probe),
+                probe,
+                "{} 应该原样返回，不该去读 / {} should be handed back, not read",
+                probe,
+                probe
+            );
+        }
     }
 
     #[test]
